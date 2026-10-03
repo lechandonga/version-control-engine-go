@@ -12,7 +12,7 @@ func hashBytes(data []byte) string {
 }
 
 func isHexID(s string) bool {
-	if len(s)) != 64 {
+	if len(s) != 64 {
 		return false
 	}
 	for _, c := range s {
