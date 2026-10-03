@@ -4,6 +4,17 @@ import "errors"
 
 // 不同失败原因使用不同的错误类型，便于自动化流程精确判定。
 
+// ConflictEntry 描述单个冲突文件的三方内容来源。
+type ConflictEntry struct {
+	// Path 为冲突文件相对工作区根的路径。
+	Path string
+	// Base/Ours/Theirs 分别为共同祖先、当前分支、合入分支上的 blob 对象 ID；
+	// 对应一方不存在时为空字符串（新增/删除冲突）。
+	Base   string
+	Ours   string
+	Theirs string
+}
+
 // ObjectMissing 表示按内容地址读取时对象文件不存在。
 type ObjectMissing struct{ ID string }
 
