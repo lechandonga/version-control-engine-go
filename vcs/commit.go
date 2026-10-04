@@ -175,6 +175,22 @@ func splitPath(p string) (string, string) {
 func (r *Repo) Commit(message string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// 老仓库可能已处于“HEAD 指向被删分支”的状态（早期版本允许删除当前分支）。
+	// 此时直接提交会产生没有父提交的新根、悄悄断开历史；明确拒绝并给出恢复指引。
+	if ref, err := r.HeadRef(); err != nil {
+		return "", err
+	} else if ref != "" {
+		if _, err := r.ReadRef(ref); err != nil {
+			if _, ok := err.(*RefNotFound); !ok {
+				return "", err
+			}
+			// 新仓库首次提交时引用尚未创建（正常）；只有操作记录表明
+			// HEAD/该分支曾经移动过，才是“当前分支被删”的悬空状态。
+			if r.hasHistoryLocked(ref) {
+				return "", &OrphanHead{Name: ref}
+			}
+		}
+	}
 	treeID, err := r.snapshot()
 	if err != nil {
 		return "", err
@@ -234,7 +250,25 @@ func (r *Repo) CreateBranch(name string) error {
 
 // DeleteBranch 删除分支；操作日志保留其最后位置，可据此找回。
 func (r *Repo) DeleteBranch(name string) error {
-	return r.DeleteRef("refs/heads/"+name, "branch-delete", "delete "+name)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ref := "refs/heads/" + name
+	// 当前检出位置所在的分支不允许删除：否则 HEAD 会悬空，下一次提交变成无父新根。
+	// 拒绝时不改动分支、HEAD、工作区与操作记录。
+	if headRef, err := r.HeadRef(); err != nil {
+		return err
+	} else if headRef == ref {
+		return &BranchCheckedOut{Name: name}
+	}
+	old, err := r.ReadRef(ref)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(r.refPath(ref)); err != nil {
+		return err
+	}
+	r.logMoveLocked("branch-delete", ref, old, "", "delete "+name)
+	return nil
 }
 
 // Checkout 切换到分支或提交，更新工作区与 HEAD。

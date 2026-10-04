@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -22,6 +23,19 @@ type ReflogEntry struct {
 
 func (r *Repo) logPath(ref string) string {
 	return filepath.Join(r.VCS, "logs", filepath.FromSlash(ref))
+}
+
+// hasHistoryLocked 报告某引用（或 HEAD）是否留有操作记录，
+// 用于区分“分支从未创建（新仓库首次提交）”与“当前分支被删（悬空 HEAD）”。
+// 调用方需持有 r.mu。
+func (r *Repo) hasHistoryLocked(ref string) bool {
+	if entries, _, err := r.ReadReflog(ref); err == nil && len(entries) > 0 {
+		return true
+	}
+	if entries, _, err := r.ReadReflog("HEAD"); err == nil && len(entries) > 0 {
+		return true
+	}
+	return false
 }
 
 // logMoveLocked 追加一条移动记录到引用日志；HEAD 依附该引用时同步记入 HEAD 日志。
@@ -140,14 +154,98 @@ func (r *Repo) ReadAllReflog() ([]ReflogEntry, []ReflogCorrupt, error) {
 	return all, corrupt, nil
 }
 
-// Recover 把引用原子地恢复到指定位置（通常取自操作记录里的 old/new），
-// 恢复动作本身也留痕。指针只可能落在旧值或新值，不会停在中间。
-func (r *Repo) Recover(ref, id string) error {
-	if !isHexID(id) {
-		return &RefCorrupt{Name: ref, Msg: "recover target is not a commit id"}
+const minShortIDLen = 7
+
+// ResolveCommitID 解析恢复目标标识：接受完整 64 位标识，也接受操作记录中
+// 展示的短前缀（至少 minShortIDLen 位十六进制）。
+// 非法前缀报 RefCorrupt；无匹配报 ObjectMissing；多匹配报 AmbiguousCommitID；
+// 目标存在但不是 commit 报 RefCorrupt。解析过程不改动任何引用。
+func (r *Repo) ResolveCommitID(prefix string) (string, error) {
+	if isHexID(prefix) {
+		if !r.HasObject(prefix) {
+			return "", &ObjectMissing{ID: prefix}
+		}
+		return prefix, r.requireCommit(prefix)
 	}
-	if !r.HasObject(id) {
-		return &ObjectMissing{ID: id}
+	if len(prefix) < minShortIDLen || !isHexPrefix(prefix) {
+		return "", &RefCorrupt{Name: prefix, Msg: "not a valid commit id (need 64 hex chars or a prefix of at least " + itoa(minShortIDLen) + ")"}
+	}
+	candidates, err := r.listObjectsByPrefix(prefix)
+	if err != nil {
+		return "", err
+	}
+	if len(candidates) == 0 {
+		return "", &ObjectMissing{ID: prefix}
+	}
+	if len(candidates) > 1 {
+		return "", &AmbiguousCommitID{Prefix: prefix, Candidates: candidates}
+	}
+	id := candidates[0]
+	return id, r.requireCommit(id)
+}
+
+func (r *Repo) requireCommit(id string) error {
+	typ, _, err := r.ReadObject(id)
+	if err != nil {
+		return err
+	}
+	if typ != TypeCommit {
+		return &RefCorrupt{Name: id, Msg: "target is a " + typ + ", not a commit"}
+	}
+	return nil
+}
+
+func isHexPrefix(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// listObjectsByPrefix 在松散对象与健康归档包中按前缀匹配对象 ID。
+func (r *Repo) listObjectsByPrefix(prefix string) ([]string, error) {
+	seen := map[string]bool{}
+	loose, err := r.listLoose()
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range loose {
+		if strings.HasPrefix(id, prefix) {
+			seen[id] = true
+		}
+	}
+	for _, pf := range r.getPacks() {
+		if pf.loadErr != nil {
+			continue
+		}
+		for id := range pf.index {
+			if strings.HasPrefix(id, prefix) {
+				seen[id] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// Recover 把引用原子地恢复到指定位置（通常取自操作记录里的 old/new，
+// 完整标识或短前缀均可）。恢复动作本身也留痕；
+// 指针只可能落在旧值或新值，不会停在中间。
+func (r *Repo) Recover(ref, target string) error {
+	id, err := r.ResolveCommitID(target)
+	if err != nil {
+		return err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()

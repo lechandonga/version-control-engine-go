@@ -2,6 +2,7 @@ package vcs
 
 import (
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 )
@@ -14,9 +15,54 @@ type GCOptions struct {
 
 // GCResult 描述一次回收的结果。
 type GCResult struct {
-	Reachable int      // 可达对象数（松散）
-	Removed   []string // 被删除（或预览将删除）的对象
+	Reachable int      // 可达对象数（松散 + 归档）
+	Removed   []string // 被删除（或预览将删除）的对象（含已归档对象）
 	Kept      []string // 不可达但因保留期保留的对象
+}
+
+// listCandidates 枚举可参与回收判定的全部对象：
+// 松散对象 + 可正常解析的归档包条目。损坏归档包中的条目不参与回收，
+// 保证坏数据永远不会因为维护操作被静默丢掉。
+func (r *Repo) listCandidates() ([]string, map[string]time.Time, error) {
+	ages := map[string]time.Time{}
+	loose, err := r.listLoose()
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, id := range loose {
+		p := r.loosePath(id)
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		// 损坏/篡改的松散对象不参与回收：无法证明其身份时绝不删除。
+		if data, err := os.ReadFile(p); err == nil {
+			if _, _, err := decodeObject(id, data); err != nil {
+				continue
+			}
+			ages[id] = st.ModTime()
+		}
+	}
+	for _, pf := range r.getPacks() {
+		if pf.loadErr != nil {
+			continue // 损坏的归档包整体保留，不参与回收
+		}
+		st, err := os.Stat(pf.path)
+		if err != nil {
+			continue
+		}
+		for id := range pf.index {
+			if _, ok := ages[id]; !ok {
+				ages[id] = st.ModTime() // 包内对象年龄以归档时间为准
+			}
+		}
+	}
+	ids := make([]string, 0, len(ages))
+	for id := range ages {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids, ages, nil
 }
 
 // Reachable 计算可达对象集合。可达根包括：
@@ -74,10 +120,9 @@ func (r *Repo) Reachable() (map[string]bool, error) {
 		}
 		typ, payload, err := r.ReadObject(id)
 		if err != nil {
-			if _, ok := err.(*ObjectMissing); ok {
-				continue // 根指向的对象本就不存在（如空仓库日志），忽略
-			}
-			return nil, err
+			// 对象不存在（空仓库日志）或所在归档包损坏：跳过遍历该分支。
+			// 安全侧原则——读不出就不标记可达，而损坏包/坏松散对象不参与回收，不会误删。
+			continue
 		}
 		reach[id] = true
 		switch typ {
@@ -102,8 +147,10 @@ func (r *Repo) Reachable() (map[string]bool, error) {
 	return reach, nil
 }
 
-// GC 回收不可达且超出保留期的松散对象。
-// 中断可重入：每次运行都重新计算可达性，逐个文件删除，重试不会误删。
+// GC 回收不可达且超出保留期的对象，不论对象存放在松散文件还是归档包中：
+// 松散对象直接删除；归档对象通过“写新包再原子替换旧包”的方式剔除，
+// 被剔除的对象在新包落盘前始终可读。
+// 中断可重入：每次运行都重新计算可达性，崩溃后重试不会误删，结果幂等稳定。
 func (r *Repo) GC(opts GCOptions) (*GCResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -111,31 +158,51 @@ func (r *Repo) GC(opts GCOptions) (*GCResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	loose, err := r.listLoose()
+	candidates, ages, err := r.listCandidates()
 	if err != nil {
 		return nil, err
 	}
 	res := &GCResult{}
 	now := r.Now()
-	for _, id := range loose {
+	remove := map[string]bool{}
+	for _, id := range candidates {
 		if reach[id] {
 			res.Reachable++
 			continue
 		}
 		if opts.Grace > 0 {
-			if st, err := os.Stat(r.loosePath(id)); err == nil {
-				if now.Sub(st.ModTime()) < opts.Grace {
-					res.Kept = append(res.Kept, id)
-					continue
-				}
+			if mt, ok := ages[id]; ok && now.Sub(mt) < opts.Grace {
+				res.Kept = append(res.Kept, id)
+				continue
 			}
 		}
 		res.Removed = append(res.Removed, id)
-		if !opts.DryRun {
-			os.Remove(r.loosePath(id)) // 单个删除失败可下次重试，不中断整体
-		}
+		remove[id] = true
 	}
 	sort.Strings(res.Removed)
 	sort.Strings(res.Kept)
+	if opts.DryRun || len(remove) == 0 {
+		return res, nil
+	}
+	// 先重写归档包（原子替换），再删除松散对象：
+	// 任何时刻对象只要仍存在就保持可读，崩溃后重试结果一致。
+	if err := r.rewritePacks(remove); err != nil {
+		return res, err
+	}
+	for id := range remove {
+		if _, err := os.Stat(r.loosePath(id)); err == nil {
+			if err := os.Remove(r.loosePath(id)); err != nil {
+				return res, err // 下次重试补删，不影响已完成的包重写
+			}
+		}
+	}
+	// 清理空的分片目录。
+	if subs, err := os.ReadDir(r.objectsDir()); err == nil {
+		for _, s := range subs {
+			if s.IsDir() {
+				os.Remove(filepath.Join(r.objectsDir(), s.Name()))
+			}
+		}
+	}
 	return res, nil
 }

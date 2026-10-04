@@ -124,7 +124,7 @@ func main() {
 		}
 		for _, e := range entries {
 			fmt.Printf("%s  %-14s %-20s %s -> %s  %s\n",
-				e.Time.Format(time.RFC3339), e.Op, e.Ref, short(e.Old), short(e.New), e.Msg)
+				e.Time.Format(time.RFC3339), e.Op, e.Ref, fullOrDash(e.Old), fullOrDash(e.New), e.Msg)
 		}
 		for _, c := range corrupt {
 			fmt.Fprintf(os.Stderr, "warning: %v\n", &c)
@@ -133,10 +133,16 @@ func main() {
 		if len(os.Args) < 4 {
 			fatalf("usage: vcs recover <ref> <commit>")
 		}
-		if err := openRepo().Recover(os.Args[2], os.Args[3]); err != nil {
+		r := openRepo()
+		ref := os.Args[2]
+		id, err := r.ResolveCommitID(os.Args[3])
+		if err != nil {
 			fatalf("%v", err)
 		}
-		fmt.Println("recovered", os.Args[2], "to", os.Args[3])
+		if err := r.Recover(ref, id); err != nil {
+			fatalf("%v", err)
+		}
+		fmt.Println("recovered", ref, "to", id)
 	case "pack":
 		res, err := openRepo().Pack()
 		if err != nil {
@@ -166,10 +172,7 @@ func main() {
 	}
 }
 
-func short(id string) string {
-	if len(id) > 8 {
-		return id[:8]
-	}
+func fullOrDash(id string) string {
 	if id == "" {
 		return "-"
 	}

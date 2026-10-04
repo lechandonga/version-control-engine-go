@@ -31,6 +31,16 @@ vcs reflog -ref refs/heads/feature   # 找到删除/回退前的位置（记录�
 vcs recover refs/heads/feature <commit-id>
 ```
 
+`vcs reflog` 输出的 old/new 始终是**完整 64 位标识**，可以直接复制给
+`vcs recover`；`recover` 同时接受至少 7 位的十六进制短前缀
+（例如 `vcs recover refs/heads/feature 7534cd6e`）：
+
+- 前缀含非法字符或长度不足 7 位：报“not a valid commit id”，引用不变；
+- 前缀没有任何匹配：报 `object missing`，引用不变；
+- 前缀匹配到多个对象：报“commit id is ambiguous”并给出匹配数量，引用不变，
+  换更长的前缀或完整标识即可；
+- 目标存在但不是 commit（如 blob/tree）：报“target is a …, not a commit”，引用不变。
+
 恢复通过 临时文件 + fsync + rename 原子落盘：进程被强杀后，指针要么停在旧值，
 要么停在新值，不会停在中间。恢复动作本身也会留痕（`op=recover`）。
 
@@ -74,6 +84,22 @@ footer  32 字节             以上全部内容的 SHA-256
 
 ## 3. 不可达回收
 
+### 与归档先后无关
+
+回收不挑对象存放位置：**松散文件和已收进归档包的对象一视同仁**。
+先 `pack` 再 `gc` 与先 `gc` 再 `pack` 结果完全一致——已归档的无引用对象
+（例如重放/提交没走完留下的中间产物）会在 `gc -dry-run` 预览中如实列出，
+确认执行后通过“写新包 → fsync → 原子替换旧包”的方式从包内剔除，仓库真正瘦下来。
+
+- 已归档对象的年龄按**归档时间（包文件修改时间）**判定保留期，
+  不会因为“先归档、后回收”被误清；
+- 剔除采用临时包 + rename，旧包在新包落盘前始终完整可读；
+  回收途中被强杀只可能留下未 rename 的 `pack-*.tmp`，重启后仓库照常可读，
+  下次 `pack`/`gc` 会清理残留并接着做完，重复运行结果幂等；
+- **混有坏数据的归档包整体不动**：损坏包中的任何对象（包括不可达的）
+  都不会被回收，包文件原样保留等待人工修复；回收不会因坏包失败，
+  其余健康包照常完成。
+
 ### 可达性规则
 
 以下位置引用的对象（含其祖先链上的 commit/tree/blob）一律视为可达：
@@ -95,11 +121,27 @@ vcs gc -dry-run            # 只预览将清理的对象
 vcs gc -grace 24h          # 确认后执行
 ```
 
-回收每次运行都重新计算可达性，逐个文件删除，**中断可重入**：上次跑到一半被强杀，
-重试只会补删剩余对象，不会误删。回收只清理松散对象，不动归档包；
+回收每次运行都重新计算可达性，松散对象逐个删除、归档对象整包原子重写，
+**中断可重入**：上次跑到一半被强杀，重试只会补删剩余对象，不会误删。
 回收完成后所有历史的读取、合并、重放结果与回收前完全一致。
 
-## 4. 兼容范围
+## 4. 当前分支保护
+
+- `vcs unbranch <name>` 删除分支时，如果该分支正是 HEAD 当前检出位置，
+  操作会被明确拒绝：
+  `cannot delete currently checked out branch: <name> (switch to another branch or commit first)`。
+  拒绝时分支引用、HEAD 指针、工作区内容与操作记录均不发生任何变化。
+  请先 `vcs switch <别的分支或提交>` 再删除。
+- 分离头指针（直接检出某个提交）状态下删除分支不受此限制。
+- **已经处于悬空状态的老仓库**（早期版本删掉当前分支，HEAD 指向的引用文件已不存在）：
+  再执行 `commit` 不会静默产生没有父提交的新根，而是报错：
+  `HEAD points to missing branch refs/heads/…; recover it with … or switch …`。
+  按提示任选其一恢复即可：
+  - `vcs reflog -ref refs/heads/<name>` 找到旧位置，
+    `vcs recover refs/heads/<name> <commit-id>` 找回分支后继续提交；
+  - 或 `vcs switch <existing-branch|commit>` 切到有效位置再提交。
+
+## 5. 兼容范围
 
 - **已有仓库无需迁移**：维护能力是纯增量的。老仓库打开后即可直接使用
   `reflog`/`pack`/`gc`；历史遗留的松散对象照常读取，第一次 `pack` 时会被收拢。
@@ -107,7 +149,7 @@ vcs gc -grace 24h          # 确认后执行
   存放形式，对象 ID、提交标识、合并与重放的判定结果都不变。
 - **不维护也可以**：不跑 `pack`/`gc` 不影响任何正常功能，只是文件数持续增长。
 
-## 5. 本地复现与验证
+## 6. 本地复现与验证
 
 ```bash
 # 全部单元测试（含场景与判定日志）
@@ -121,10 +163,14 @@ go build -o /tmp/vcs ./cmd/vcs
 cd /path/to/repo
 /tmp/vcs init && echo hi > a.txt && /tmp/vcs commit -m c1
 /tmp/vcs branch dev && /tmp/vcs unbranch dev
-/tmp/vcs reflog -ref refs/heads/dev        # 找到删除前位置
-/tmp/vcs recover refs/heads/dev <id>       # 找回
+/tmp/vcs reflog -ref refs/heads/dev        # old/new 为完整标识，直接复制
+/tmp/vcs recover refs/heads/dev <id>       # 完整标识或 ≥7 位短前缀均可
 /tmp/vcs pack                              # 归档
-/tmp/vcs gc -dry-run                       # 预览回收
+/tmp/vcs gc -dry-run                       # 预览（含已归档的无引用对象）
+/tmp/vcs gc                                # 先归档后回收也能真正瘦下来
+
+# 当前分支保护
+/tmp/vcs unbranch master                   # 被拒绝并提示先 switch
 ```
 
 测试覆盖场景（日志中可见判定依据）：
@@ -134,6 +180,11 @@ cd /path/to/repo
 - 归档前后读取一致（`TestPackReadConsistency`）、反复归档幂等（`TestPackIdempotent`）
 - 归档文件截断/篡改/头部损坏的分类报错（`TestPackCorruptionClassification`）
 - 可达性判断：在途重放/合并现场、保留期边界、操作记录根（`TestGCReachability`、`TestGCInFlightState`、`TestGCGracePeriod`）
-- 归档/回收中途强杀后重启可用、重试成功（`TestPackCrashRecovery`、`TestGCInterruptReentrant`）
-- 维护与正常写入并发稳定性（`TestPackConcurrentWrites`）
+- 归档/回收中途强杀后重启可用、重试成功（`TestPackCrashRecovery`、`TestGCInterruptReentrant`、`TestGCInterruptReentrantPacked`）
+- 维护与正常写入并发稳定性（`TestPackConcurrentWrites`、`TestGCConcurrentWrites`）
+- 先归档后回收：已归档无引用对象预览列出并真正清除、可达对象/找回链路不受影响（`TestGCPackedUnreachable`）
+- 保留期与归档/回收顺序无关（`TestGCPackedGraceOrderIndependent`）、坏归档包整体不被动（`TestGCCorruptPackUntouched`）
+- 当前分支删除被拒绝且分支/位置/工作区/记录不变，其他分支可删可找回（`TestDeleteCurrentBranchRejected`）
+- 悬空 HEAD 老仓库不再静默断链，按报错指引恢复后续链正常（`TestOrphanHeadOldRepoGuarded`）
+- 查看记录→短标识恢复链路，非法/不存在/非提交/不唯一目标处理（`TestReflogToRecoverShortID`）
 - 上万对象规模的文件数压缩与读耗时（`TestPackScaleReduction`）

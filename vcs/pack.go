@@ -184,6 +184,101 @@ func (r *Repo) packHas(id string) bool {
 	return false
 }
 
+// rewritePacks 重写归档包，剔除 remove 集合中的对象。
+// 损坏的包整体不动；健康包通过“写临时文件 → fsync → 原子 rename”替换：
+// 新包落盘前旧包仍完整可读，任何时刻崩溃仓库都照常可读，重试结果一致。
+// 调用方需持有 r.mu。
+func (r *Repo) rewritePacks(remove map[string]bool) error {
+	// 清理上次归档/回收崩溃残留的临时包文件。
+	if tmps, _ := filepath.Glob(filepath.Join(r.packsDir(), "*.tmp")); len(tmps) > 0 {
+		for _, t := range tmps {
+			os.Remove(t)
+		}
+		r.packMu.Lock()
+		r.packsLoaded = false
+		r.packMu.Unlock()
+		r.loadPacks()
+	}
+	for _, pf := range r.getPacks() {
+		if pf.loadErr != nil {
+			continue // 损坏包：不丢任何数据，也不阻断其它包回收
+		}
+		var kept []string
+		for id := range pf.index {
+			if !remove[id] {
+				kept = append(kept, id)
+			}
+		}
+		if len(kept) == len(pf.index) {
+			continue // 该包没有可剔除对象
+		}
+		data, err := os.ReadFile(pf.path)
+		if err != nil {
+			return err
+		}
+		sort.Strings(kept)
+		var buf bytes.Buffer
+		buf.WriteString(packMagic)
+		var tmp8 [8]byte
+		binary.BigEndian.PutUint64(tmp8[:], uint64(len(kept)))
+		buf.Write(tmp8[:])
+		for _, id := range kept {
+			ent := pf.index[id]
+			if ent.offset+ent.length > int64(len(data)) {
+				return &ObjectTruncated{ID: id}
+			}
+			payload := data[ent.offset : ent.offset+ent.length]
+			if hashBytes(payload) != id {
+				return &ObjectTampered{ID: id}
+			}
+			buf.WriteString(id)
+			var tmp2 [2]byte
+			binary.BigEndian.PutUint16(tmp2[:], uint16(len(ent.typ)))
+			buf.Write(tmp2[:])
+			buf.WriteString(ent.typ)
+			binary.BigEndian.PutUint64(tmp8[:], uint64(ent.length))
+			buf.Write(tmp8[:])
+			buf.Write(payload)
+		}
+		sum := sha256.Sum256(buf.Bytes())
+		buf.Write(sum[:])
+		if err := os.MkdirAll(r.packsDir(), 0o755); err != nil {
+			return err
+		}
+		tmp, err := os.CreateTemp(r.packsDir(), "pack-*.tmp")
+		if err != nil {
+			return err
+		}
+		tmpName := tmp.Name()
+		cleanup := func() { tmp.Close(); os.Remove(tmpName) }
+		if _, err := tmp.Write(buf.Bytes()); err != nil {
+			cleanup()
+			return err
+		}
+		if err := tmp.Sync(); err != nil {
+			cleanup()
+			return err
+		}
+		if err := tmp.Close(); err != nil {
+			os.Remove(tmpName)
+			return err
+		}
+		if err := os.Rename(tmpName, pf.path); err != nil {
+			os.Remove(tmpName)
+			return err
+		}
+		if len(kept) == 0 {
+			os.Remove(pf.path) // 整包都是垃圾：替换后删除空包
+		}
+	}
+	// 归档集合发生变化，强制下次重读。
+	r.packMu.Lock()
+	r.packsLoaded = false
+	r.packMu.Unlock()
+	r.loadPacks()
+	return nil
+}
+
 // PackResult 描述一次归档的结果。
 type PackResult struct {
 	Packed   int      // 本次收拢的对象数

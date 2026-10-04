@@ -32,6 +32,35 @@ type RefNotFound struct{ Name string }
 
 func (e *RefNotFound) Error() string { return "ref not found: " + e.Name }
 
+// BranchCheckedOut 表示要删除的分支正是当前检出位置。
+type BranchCheckedOut struct{ Name string }
+
+func (e *BranchCheckedOut) Error() string {
+	return "cannot delete currently checked out branch: " + e.Name +
+		" (switch to another branch or commit first)"
+}
+
+// OrphanHead 表示 HEAD 指向的分支文件已丢失（通常来自早期版本误删当前分支）。
+// 继续提交会产生没有父提交的新根，因此明确拒绝并给出恢复指引。
+type OrphanHead struct{ Name string }
+
+func (e *OrphanHead) Error() string {
+	return "HEAD points to missing branch " + e.Name + "; " +
+		"recover it with `vcs recover " + e.Name + " <commit-id from reflog>`, " +
+		"or `vcs switch <existing-branch|commit>` before committing"
+}
+
+// AmbiguousCommitID 表示短标识匹配到多个对象，无法唯一确定恢复目标。
+type AmbiguousCommitID struct {
+	Prefix     string
+	Candidates []string
+}
+
+func (e *AmbiguousCommitID) Error() string {
+	return "commit id is ambiguous: " + e.Prefix +
+		" matches " + itoa(len(e.Candidates)) + " objects; use a longer prefix or the full id"
+}
+
 // RefCorrupt 表示引用文件内容损坏（不是合法哈希/符号引用）。
 type RefCorrupt struct {
 	Name string
