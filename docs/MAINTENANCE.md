@@ -31,6 +31,17 @@ vcs reflog -ref refs/heads/feature   # 找到删除/回退前的位置（记录�
 vcs recover refs/heads/feature <commit-id>
 ```
 
+**目标标识可以直接用记录里展示的短标识。** `reflog` 输出里 `old`/`new` 列是
+8 位短标识，`recover` 会自动把它解析为完整提交（在松散对象和归档包里一起查找）：
+
+- 短标识唯一匹配：直接恢复；
+- 匹配到多个对象：报 `ambiguous commit id prefix`，加几位再试；
+- 格式非法（非十六进制、不足 4 位）：报 `invalid commit id`；
+- 合法但不存在：报 `object missing`。
+
+以上失败都不会改动任何引用。需要完整标识时，也可以直接看
+`.vcs/logs/<引用路径>` 里的原始 JSON 记录。
+
 恢复通过 临时文件 + fsync + rename 原子落盘：进程被强杀后，指针要么停在旧值，
 要么停在新值，不会停在中间。恢复动作本身也会留痕（`op=recover`）。
 
@@ -87,6 +98,9 @@ footer  32 字节             以上全部内容的 SHA-256
 
 修改时间距今不足保留期（默认 24h，`-grace` 可调）的对象一律保留，
 避免“刚提交完、引用尚未落稳”的对象被误判为垃圾。
+对已经收进归档包的对象，保留期按**所在包的修改时间**保守判定：
+包在保留期内则整包保留。因此“先归档再回收”和“先回收再归档”两种顺序
+都不会误清保留期内的对象。
 
 ### 使用
 
@@ -95,11 +109,48 @@ vcs gc -dry-run            # 只预览将清理的对象
 vcs gc -grace 24h          # 确认后执行
 ```
 
-回收每次运行都重新计算可达性，逐个文件删除，**中断可重入**：上次跑到一半被强杀，
-重试只会补删剩余对象，不会误删。回收只清理松散对象，不动归档包；
-回收完成后所有历史的读取、合并、重放结果与回收前完全一致。
+### 归档后回收的语义
 
-## 4. 兼容范围
+回收**不挑对象存放位置**：松散对象和已收进归档包的对象一视同仁。
+归档包里的无引用对象通过“重写剔除”回收——把要保留的条目写入新包
+（临时文件 + fsync + rename），落盘后再删除旧包；整包都是垃圾时直接删包。
+因此：
+
+- 先 `pack` 再 `gc`：预览（`-dry-run`）如实列出包内将清理的对象，确认后真正
+  清掉，仓库体积随之下降；
+- 崩溃安全：重写中途被强杀，任意时刻对象至少在旧包或新包之一里，历史不会
+  读不了；重试会基于重新扫描的状态继续，结果幂等；
+- 损坏的归档包（截断/篡改/头部非法）保持原样不动，回收不会碰它，也不影响
+  其余包的回收与正常读取；
+- 与正常写入并发：新对象照常写松散文件，回收只处理扫描时看到的集合。
+
+回收每次运行都重新计算可达性，逐个文件删除，**中断可重入**：上次跑到一半被强杀，
+重试只会补删剩余对象，不会误删。回收完成后所有历史的读取、合并、重放结果
+与回收前完全一致。
+
+## 4. 当前分支保护
+
+删除**当前所在分支**会被明确拒绝：
+
+```
+$ vcs unbranch master
+vcs: cannot delete current branch: master (switch to another branch first)
+```
+
+拒绝时分支、HEAD、工作区、操作记录都不发生任何变化。删除其他分支照常可用，
+且能按记录找回。请先 `vcs switch` 到别的分支再删。
+
+**老仓库的悬空 HEAD**：历史版本可能已经把当前分支删掉（HEAD 指向一个不存在
+的分支）。在这种仓库上提交会明确报错而不是静默产生无父新根：
+
+```
+vcs: HEAD points to missing branch refs/heads/master; recover it with:
+vcs recover refs/heads/master <commit-id> (see: vcs reflog -ref refs/heads/master)
+```
+
+按指引从记录里找到删除前位置恢复（短标识即可），之后提交照常接在原历史之后。
+
+## 5. 兼容范围
 
 - **已有仓库无需迁移**：维护能力是纯增量的。老仓库打开后即可直接使用
   `reflog`/`pack`/`gc`；历史遗留的松散对象照常读取，第一次 `pack` 时会被收拢。
@@ -107,7 +158,7 @@ vcs gc -grace 24h          # 确认后执行
   存放形式，对象 ID、提交标识、合并与重放的判定结果都不变。
 - **不维护也可以**：不跑 `pack`/`gc` 不影响任何正常功能，只是文件数持续增长。
 
-## 5. 本地复现与验证
+## 6. 本地复现与验证
 
 ```bash
 # 全部单元测试（含场景与判定日志）
@@ -121,19 +172,32 @@ go build -o /tmp/vcs ./cmd/vcs
 cd /path/to/repo
 /tmp/vcs init && echo hi > a.txt && /tmp/vcs commit -m c1
 /tmp/vcs branch dev && /tmp/vcs unbranch dev
-/tmp/vcs reflog -ref refs/heads/dev        # 找到删除前位置
-/tmp/vcs recover refs/heads/dev <id>       # 找回
+/tmp/vcs reflog -ref refs/heads/dev        # 找到删除前位置（短标识即可）
+/tmp/vcs recover refs/heads/dev <短标识>    # 找回
 /tmp/vcs pack                              # 归档
 /tmp/vcs gc -dry-run                       # 预览回收
+/tmp/vcs gc                                # 确认回收（含已归档的无引用对象）
+
+# 当前分支保护
+/tmp/vcs unbranch master                   # 拒绝：cannot delete current branch
 ```
 
 测试覆盖场景（日志中可见判定依据）：
 
 - 按记录找回被删分支 / 回退位置（`TestRecoverDeletedBranch`、`TestRecoverAfterRebaseAbort`）
+- 查看记录到恢复的完整链路：短标识直接可用（`TestRecoverWithShortID`、`TestRecoverShortIDAfterPack`）；
+  非法 / 不存在 / 不唯一目标报错且引用不变（`TestRecoverInvalidTargets`）
 - 记录损坏的分类识别与隔离（`TestReflogCorruptIsolation`）
+- 删除当前所在分支被拒绝且现场不变（`TestDeleteCurrentBranchRejected`）；
+  删除其他分支可找回（`TestDeleteOtherBranchAndRecover`）；
+  悬空 HEAD 的老仓库提交明确报错并给出恢复指引（`TestDanglingHeadCommit`）
 - 归档前后读取一致（`TestPackReadConsistency`）、反复归档幂等（`TestPackIdempotent`）
 - 归档文件截断/篡改/头部损坏的分类报错（`TestPackCorruptionClassification`）
 - 可达性判断：在途重放/合并现场、保留期边界、操作记录根（`TestGCReachability`、`TestGCInFlightState`、`TestGCGracePeriod`）
+- 先归档后回收：包内无引用对象预览列出并真正清掉、可达对象不动、纯垃圾包整体删除
+  （`TestGCPackThenGC`、`TestGCPackOnlyGarbage`）；保留期对已归档对象同样生效（`TestGCPackGracePeriod`）；
+  损坏归档包隔离不动（`TestGCPackCorruptUntouched`）
 - 归档/回收中途强杀后重启可用、重试成功（`TestPackCrashRecovery`、`TestGCInterruptReentrant`）
-- 维护与正常写入并发稳定性（`TestPackConcurrentWrites`）
+- 回收重写归档包中途强杀后重试稳定（`TestGCPackRewriteCrashReentrant`）
+- 维护与正常写入并发稳定性（`TestPackConcurrentWrites`、`TestGCPackConcurrentWrites`）
 - 上万对象规模的文件数压缩与读耗时（`TestPackScaleReduction`）

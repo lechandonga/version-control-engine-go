@@ -40,6 +40,37 @@ type RefCorrupt struct {
 
 func (e *RefCorrupt) Error() string { return "ref corrupt: " + e.Name + ": " + e.Msg }
 
+// CurrentBranch 表示试图删除当前所在分支（会导致历史链断开）。
+type CurrentBranch struct{ Name string }
+
+func (e *CurrentBranch) Error() string {
+	return "cannot delete current branch: " + e.Name + " (switch to another branch first)"
+}
+
+// HeadBranchMissing 表示 HEAD 指向的分支已不存在（如被旧版本误删），
+// 继续提交会产生没有父提交的新根，必须显式处理。
+type HeadBranchMissing struct{ Ref string }
+
+func (e *HeadBranchMissing) Error() string {
+	return "HEAD points to missing branch " + e.Ref +
+		"; recover it with: vcs recover " + e.Ref + " <commit-id> (see: vcs reflog -ref " + e.Ref + ")"
+}
+
+// InvalidID 表示给出的提交标识格式非法（不是十六进制或长度不足）。
+type InvalidID struct{ Value string }
+
+func (e *InvalidID) Error() string { return "invalid commit id: " + e.Value }
+
+// AmbiguousID 表示短标识匹配到多个对象，需要更长的前缀。
+type AmbiguousID struct {
+	Prefix  string
+	Matches []string
+}
+
+func (e *AmbiguousID) Error() string {
+	return "ambiguous commit id prefix: " + e.Prefix + " (matches " + itoa(len(e.Matches)) + " objects)"
+}
+
 // WouldOverwrite 表示操作会覆盖本地未提交修改或未跟踪文件。
 type WouldOverwrite struct{ Paths []string }
 

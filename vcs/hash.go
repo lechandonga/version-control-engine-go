@@ -15,6 +15,14 @@ func isHexID(s string) bool {
 	if len(s) != 64 {
 		return false
 	}
+	return isHexPrefix(s)
+}
+
+// isHexPrefix 报告字符串是否全由小写十六进制字符组成（长度不限）。
+func isHexPrefix(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
 	for _, c := range s {
 		switch {
 		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':

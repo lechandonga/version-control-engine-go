@@ -175,6 +175,9 @@ func splitPath(p string) (string, string) {
 func (r *Repo) Commit(message string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkHeadIntactLocked(); err != nil {
+		return "", err
+	}
 	treeID, err := r.snapshot()
 	if err != nil {
 		return "", err
@@ -233,8 +236,20 @@ func (r *Repo) CreateBranch(name string) error {
 }
 
 // DeleteBranch 删除分支；操作日志保留其最后位置，可据此找回。
+// 当前所在分支拒绝删除：删了会让下一次提交变成无父新根，历史链被悄悄断开。
+// 拒绝时不改动分支、HEAD、工作区与操作记录。
 func (r *Repo) DeleteBranch(name string) error {
-	return r.DeleteRef("refs/heads/"+name, "branch-delete", "delete "+name)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ref := "refs/heads/" + name
+	headRef, err := r.HeadRef()
+	if err != nil {
+		return err
+	}
+	if headRef == ref {
+		return &CurrentBranch{Name: name}
+	}
+	return r.deleteRefLocked(ref, "branch-delete", "delete "+name)
 }
 
 // Checkout 切换到分支或提交，更新工作区与 HEAD。

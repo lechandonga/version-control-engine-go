@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -140,18 +141,64 @@ func (r *Repo) ReadAllReflog() ([]ReflogEntry, []ReflogCorrupt, error) {
 	return all, corrupt, nil
 }
 
-// Recover 把引用原子地恢复到指定位置（通常取自操作记录里的 old/new），
-// 恢复动作本身也留痕。指针只可能落在旧值或新值，不会停在中间。
-func (r *Repo) Recover(ref, id string) error {
-	if !isHexID(id) {
-		return &RefCorrupt{Name: ref, Msg: "recover target is not a commit id"}
+// ResolveID 把完整或短标识（至少 4 位十六进制前缀）解析为完整对象 ID。
+// 短标识在松散对象与归档包中一起查找；不唯一时返回 AmbiguousID。
+func (r *Repo) ResolveID(prefix string) (string, error) {
+	if isHexID(prefix) {
+		return prefix, nil
 	}
-	if !r.HasObject(id) {
-		return &ObjectMissing{ID: id}
+	if len(prefix) < 4 || len(prefix) > 64 || !isHexPrefix(prefix) {
+		return "", &InvalidID{Value: prefix}
+	}
+	matches := map[string]bool{}
+	loose, err := r.listLoose()
+	if err != nil {
+		return "", err
+	}
+	for _, id := range loose {
+		if strings.HasPrefix(id, prefix) {
+			matches[id] = true
+		}
+	}
+	for _, pf := range r.getPacks() {
+		if pf.loadErr != nil {
+			continue // 损坏的包不参与解析，保持原样
+		}
+		for id := range pf.index {
+			if strings.HasPrefix(id, prefix) {
+				matches[id] = true
+			}
+		}
+	}
+	ids := make([]string, 0, len(matches))
+	for id := range matches {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return "", &ObjectMissing{ID: prefix}
+	}
+	if len(ids) > 1 {
+		return "", &AmbiguousID{Prefix: prefix, Matches: ids}
+	}
+	return ids[0], nil
+}
+
+// Recover 把引用原子地恢复到指定位置（通常取自操作记录里的 old/new，
+// 支持记录里展示的短标识）。恢复动作本身也留痕。
+// 指针只可能落在旧值或新值，不会停在中间；非法、不存在、不唯一的目标
+// 都会报错且不改动任何引用。
+func (r *Repo) Recover(ref, id string) error {
+	full, err := r.ResolveID(id)
+	if err != nil {
+		return err
+	}
+	if !r.HasObject(full) {
+		return &ObjectMissing{ID: full}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.writeRefLocked(ref, id, "recover", "recover to "+shortID(id))
+	return r.writeRefLocked(ref, full, "recover", "recover to "+shortID(full))
 }
 
 // reflogRootIDs 收集操作记录中出现的全部对象 ID（作为回收的可达根）。

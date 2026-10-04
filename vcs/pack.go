@@ -26,6 +26,13 @@ type packEntry struct {
 	length int64
 }
 
+// packItem 是待写入归档包的一条对象。
+type packItem struct {
+	id      string
+	typ     string
+	payload []byte
+}
+
 type packFile struct {
 	path    string
 	index   map[string]packEntry
@@ -63,6 +70,13 @@ func (r *Repo) getPacks() []*packFile {
 	r.packMu.Lock()
 	defer r.packMu.Unlock()
 	return r.packs
+}
+
+// invalidatePacks 使归档包缓存失效，下次访问时重新扫描。
+func (r *Repo) invalidatePacks() {
+	r.packMu.Lock()
+	r.packsLoaded = false
+	r.packMu.Unlock()
 }
 
 // parsePack 解析归档包；结构损坏时保留部分索引并记录分类错误。
@@ -132,6 +146,27 @@ func classifyPackErr(template error, id string) error {
 	}
 }
 
+// packEntryData 读取某个包条目的负载并校验完整性。
+func (r *Repo) packEntryData(pf *packFile, id string, ent packEntry) ([]byte, error) {
+	r.packMu.Lock()
+	if pf.data == nil {
+		pf.data, _ = os.ReadFile(pf.path)
+	}
+	data := pf.data
+	r.packMu.Unlock()
+	if data == nil {
+		return nil, &ObjectMissing{ID: id}
+	}
+	if ent.offset+ent.length > int64(len(data)) {
+		return nil, &ObjectTruncated{ID: id}
+	}
+	payload := data[ent.offset : ent.offset+ent.length]
+	if hashBytes(payload) != id {
+		return nil, &ObjectTampered{ID: id}
+	}
+	return payload, nil
+}
+
 // packRead 从归档包读取对象。
 func (r *Repo) packRead(id string) (string, []byte, error) {
 	var packErr error
@@ -149,21 +184,9 @@ func (r *Repo) packRead(id string) (string, []byte, error) {
 		if !ok {
 			continue
 		}
-		r.packMu.Lock()
-		if pf.data == nil {
-			pf.data, _ = os.ReadFile(pf.path)
-		}
-		data := pf.data
-		r.packMu.Unlock()
-		if data == nil {
-			return "", nil, &ObjectMissing{ID: id}
-		}
-		if ent.offset+ent.length > int64(len(data)) {
-			return "", nil, &ObjectTruncated{ID: id}
-		}
-		payload := data[ent.offset : ent.offset+ent.length]
-		if hashBytes(payload) != id {
-			return "", nil, &ObjectTampered{ID: id}
+		payload, err := r.packEntryData(pf, id, ent)
+		if err != nil {
+			return "", nil, err
 		}
 		return ent.typ, payload, nil
 	}
@@ -182,6 +205,96 @@ func (r *Repo) packHas(id string) bool {
 		}
 	}
 	return false
+}
+
+// packFileName 由排序后的对象 ID 列表决定包名，同一批内容名字相同，天然幂等。
+func packFileName(items []packItem) string {
+	idList := make([]string, len(items))
+	for i, it := range items {
+		idList[i] = it.id
+	}
+	return "pack-" + hashBytes([]byte(strings.Join(idList, "\n")))[:32] + ".pack"
+}
+
+// writePackAtomic 把条目写入临时文件、fsync 后 rename 为正式包文件。
+// 包已存在时直接复用。返回包文件名。
+func (r *Repo) writePackAtomic(items []packItem) (string, error) {
+	sort.Slice(items, func(i, j int) bool { return items[i].id < items[j].id })
+	name := packFileName(items)
+	final := filepath.Join(r.packsDir(), name)
+	if _, err := os.Stat(final); err == nil {
+		return name, nil
+	}
+	var buf bytes.Buffer
+	buf.WriteString(packMagic)
+	var tmp8 [8]byte
+	binary.BigEndian.PutUint64(tmp8[:], uint64(len(items)))
+	buf.Write(tmp8[:])
+	for _, it := range items {
+		buf.WriteString(it.id)
+		var tmp2 [2]byte
+		binary.BigEndian.PutUint16(tmp2[:], uint16(len(it.typ)))
+		buf.Write(tmp2[:])
+		buf.WriteString(it.typ)
+		binary.BigEndian.PutUint64(tmp8[:], uint64(len(it.payload)))
+		buf.Write(tmp8[:])
+		buf.Write(it.payload)
+	}
+	sum := sha256.Sum256(buf.Bytes())
+	buf.Write(sum[:])
+	if err := os.MkdirAll(r.packsDir(), 0o755); err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(r.packsDir(), "pack-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	if _, err := tmp.Write(buf.Bytes()); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := os.Rename(tmp.Name(), final); err != nil {
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	return name, nil
+}
+
+// rewritePackWithout 重写归档包，剔除指定对象（回收已归档垃圾时使用）。
+// 崩溃安全：新包先落盘再删旧包；任意时刻中断，对象至少在其中一个包里，
+// 重试会基于重新扫描的状态继续，结果幂等。
+func (r *Repo) rewritePackWithout(pf *packFile, drop map[string]bool) error {
+	var items []packItem
+	for id, ent := range pf.index {
+		if drop[id] {
+			continue
+		}
+		payload, err := r.packEntryData(pf, id, ent)
+		if err != nil {
+			return err
+		}
+		items = append(items, packItem{id: id, typ: ent.typ, payload: payload})
+	}
+	if len(items) > 0 {
+		if _, err := r.writePackAtomic(items); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(pf.path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	r.invalidatePacks()
+	return nil
 }
 
 // PackResult 描述一次归档的结果。
@@ -208,12 +321,7 @@ func (r *Repo) Pack() (*PackResult, error) {
 		return nil, err
 	}
 	res := &PackResult{}
-	type item struct {
-		id      string
-		typ     string
-		payload []byte
-	}
-	var items []item
+	var items []packItem
 	for _, id := range ids {
 		data, err := os.ReadFile(r.loosePath(id))
 		if err != nil {
@@ -224,68 +332,19 @@ func (r *Repo) Pack() (*PackResult, error) {
 			res.Skipped = append(res.Skipped, id) // 损坏对象留在原地，错误分类不丢失
 			continue
 		}
-		items = append(items, item{id: id, typ: typ, payload: payload})
+		items = append(items, packItem{id: id, typ: typ, payload: payload})
 	}
 	if len(items) == 0 {
 		return res, nil
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].id < items[j].id })
-	idList := make([]string, len(items))
-	for i, it := range items {
-		idList[i] = it.id
-	}
-	name := "pack-" + hashBytes([]byte(strings.Join(idList, "\n")))[:32] + ".pack"
-	final := filepath.Join(r.packsDir(), name)
 	res.Packed = len(items)
-	res.PackFile = name
-	if _, err := os.Stat(final); err != nil {
-		var buf bytes.Buffer
-		buf.WriteString(packMagic)
-		var tmp8 [8]byte
-		binary.BigEndian.PutUint64(tmp8[:], uint64(len(items)))
-		buf.Write(tmp8[:])
-		for _, it := range items {
-			buf.WriteString(it.id)
-			var tmp2 [2]byte
-			binary.BigEndian.PutUint16(tmp2[:], uint16(len(it.typ)))
-			buf.Write(tmp2[:])
-			buf.WriteString(it.typ)
-			binary.BigEndian.PutUint64(tmp8[:], uint64(len(it.payload)))
-			buf.Write(tmp8[:])
-			buf.Write(it.payload)
-		}
-		sum := sha256.Sum256(buf.Bytes())
-		buf.Write(sum[:])
-		if err := os.MkdirAll(r.packsDir(), 0o755); err != nil {
-			return nil, err
-		}
-		tmp, err := os.CreateTemp(r.packsDir(), "pack-*.tmp")
-		if err != nil {
-			return nil, err
-		}
-		if _, err := tmp.Write(buf.Bytes()); err != nil {
-			tmp.Close()
-			os.Remove(tmp.Name())
-			return nil, err
-		}
-		if err := tmp.Sync(); err != nil {
-			tmp.Close()
-			os.Remove(tmp.Name())
-			return nil, err
-		}
-		if err := tmp.Close(); err != nil {
-			os.Remove(tmp.Name())
-			return nil, err
-		}
-		if err := os.Rename(tmp.Name(), final); err != nil {
-			os.Remove(tmp.Name())
-			return nil, err
-		}
+	name, err := r.writePackAtomic(items)
+	if err != nil {
+		return nil, err
 	}
+	res.PackFile = name
 	// 包已落盘：刷新缓存后再删除松散文件，保证任何时刻对象都可读。
-	r.packMu.Lock()
-	r.packsLoaded = false
-	r.packMu.Unlock()
+	r.invalidatePacks()
 	r.loadPacks()
 	for _, it := range items {
 		os.Remove(r.loosePath(it.id))

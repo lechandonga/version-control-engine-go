@@ -79,6 +79,11 @@ func (r *Repo) writeRefLocked(name, id, op, msg string) error {
 func (r *Repo) DeleteRef(name, op, msg string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.deleteRefLocked(name, op, msg)
+}
+
+// deleteRefLocked 删除引用的实际实现。调用方需持有 r.mu。
+func (r *Repo) deleteRefLocked(name, op, msg string) error {
 	old, err := r.ReadRef(name)
 	if err != nil {
 		return err
@@ -87,6 +92,32 @@ func (r *Repo) DeleteRef(name, op, msg string) error {
 		return err
 	}
 	r.logMoveLocked(op, name, old, "", msg)
+	return nil
+}
+
+// checkHeadIntactLocked 识别“HEAD 指向的分支已被删除”的异常状态，
+// 避免在这种老仓库上静默提交出没有父提交的新根。调用方需持有 r.mu。
+func (r *Repo) checkHeadIntactLocked() error {
+	ref, err := r.HeadRef()
+	if err != nil {
+		return err
+	}
+	if ref == "" {
+		return nil // 分离头指针，不依赖分支
+	}
+	if _, err := r.ReadRef(ref); err == nil {
+		return nil
+	} else if _, ok := err.(*RefNotFound); !ok {
+		return err
+	}
+	// 分支不存在：全新仓库（无任何操作记录）属正常；有记录说明分支被删过。
+	entries, _, err := r.ReadReflog(ref)
+	if err != nil {
+		return err
+	}
+	if len(entries) > 0 {
+		return &HeadBranchMissing{Ref: ref}
+	}
 	return nil
 }
 

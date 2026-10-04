@@ -32,14 +32,14 @@ func main() {
   init                          初始化仓库
   commit -m <msg>               提交工作区快照
   branch <name>                 创建分支
-  unbranch <name>               删除分支（留痕，可 recover 找回）
+  unbranch <name>               删除分支（当前所在分支拒绝；留痕，可 recover 找回）
   switch <name|commit>          切换分支或检出提交
   merge <name>                  合并目标分支
   merge -abort                  放弃在途合并
   rebase <name>                 把当前分支重放到目标之上
   rebase -continue|-abort       继续 / 回退在途重放
   reflog [-ref <name>]          查看操作留痕（默认全部，按时间排序）
-  recover <ref> <commit>        按记录把引用恢复到指定位置
+  recover <ref> <commit>        按记录把引用恢复到指定位置（支持记录里的短标识）
   pack                          把松散对象归档为包文件
   gc [-dry-run] [-grace 24h]    回收不可达对象`)
 		return

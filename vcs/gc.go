@@ -102,8 +102,12 @@ func (r *Repo) Reachable() (map[string]bool, error) {
 	return reach, nil
 }
 
-// GC 回收不可达且超出保留期的松散对象。
-// 中断可重入：每次运行都重新计算可达性，逐个文件删除，重试不会误删。
+// GC 回收不可达且超出保留期的对象，无论其存放在松散文件还是归档包中。
+// 归档包通过“重写剔除”回收：保留条目写入新包后再删除旧包，崩溃安全且幂等。
+// 保留期对松散对象按自身修改时间判定；对已归档对象按所在包的修改时间判定
+// （保守：包在保留期内则整包保留），因此归档与回收的先后顺序不会误清新对象。
+// 损坏的归档包保持原样不动，由人工处理。
+// 中断可重入：每次运行都重新计算可达性，逐个文件删除/重写，重试不会误删。
 func (r *Repo) GC(opts GCOptions) (*GCResult, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -133,6 +137,35 @@ func (r *Repo) GC(opts GCOptions) (*GCResult, error) {
 		res.Removed = append(res.Removed, id)
 		if !opts.DryRun {
 			os.Remove(r.loosePath(id)) // 单个删除失败可下次重试，不中断整体
+		}
+	}
+	// 归档包内的不可达对象：重写包剔除。损坏的包跳过，保持原样。
+	for _, pf := range r.getPacks() {
+		if pf.loadErr != nil {
+			continue
+		}
+		keepAll := false
+		if opts.Grace > 0 {
+			if st, err := os.Stat(pf.path); err == nil && now.Sub(st.ModTime()) < opts.Grace {
+				keepAll = true
+			}
+		}
+		drop := map[string]bool{}
+		for id := range pf.index {
+			if reach[id] {
+				continue
+			}
+			if keepAll {
+				res.Kept = append(res.Kept, id)
+				continue
+			}
+			drop[id] = true
+			res.Removed = append(res.Removed, id)
+		}
+		if len(drop) > 0 && !opts.DryRun {
+			if err := r.rewritePackWithout(pf, drop); err != nil {
+				return nil, err
+			}
 		}
 	}
 	sort.Strings(res.Removed)
